@@ -15,7 +15,8 @@ def gelu(x):
         Input: Tensor
         Output: Tensor
     """
-    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+    # x**3 一般比torch.pow(x, 3)更快
+    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x**3)))
 
 
 def softmax(x):
@@ -25,8 +26,11 @@ def softmax(x):
         Output: Tensor
     """
     # subtract the max for numerical stability (does not change the result)
+    # 对所有数值都减去它们当中的最大值
     x = x - x.max(dim=-1, keepdim=True).values
+    # 进行指数放大
     e = torch.exp(x)
+    # 输出向量
     return e / e.sum(dim=-1, keepdim=True)
 
 
@@ -38,12 +42,18 @@ def layer_norm(x, g_b, eps:float = 1e-5):
             g_b: dictionary that load from gpt2 weight. g-gamma and b-bias are the keys
         Output: Tensor
     """
+    # g 存储 gamma，b 存储 beta
+    # 获取这两个值
     g, b = torch.Tensor(g_b['g']), torch.Tensor(g_b['b'])
 
     # normalize over the last (embedding) dimension, then scale and shift
+    # 求出均值
     mean = x.mean(dim=-1, keepdim=True)
+    # 求出方差
     var = x.var(dim=-1, keepdim=True, unbiased=False)
+    # 标准化（分母加上eps防止发生除零运算）
     x_hat = (x - mean) / torch.sqrt(var + eps)
+    # 恢复 gamma 和 beta
     return x_hat * g + b
 
 def linear(x, w_b):  # [m, in], [in, out], [out] -> [m, out]
@@ -55,9 +65,11 @@ def linear(x, w_b):  # [m, in], [in, out], [out] -> [m, out]
         Output: Tensor
     """
     # keep everything as torch tensors so that downstream ops (e.g. `.chunk`) work
+    # 获取张量 x，w，b
     x = torch.as_tensor(x)
     w = torch.as_tensor(w_b['w']).to(x.dtype)
     b = torch.as_tensor(w_b['b']).to(x.dtype)
+    # 直接进行矩阵运算
     return x @ w + b
     
 
@@ -71,6 +83,7 @@ def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Output: Tensor
     """
     w_b1, w_b2 = mlp['c_fc'], mlp['c_proj']
+    # 复用实现的 linear 和 gelu
     return linear(gelu(linear(x, w_b1)), w_b2)
 
 
@@ -87,8 +100,11 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
             mlp: dictionary that load from gpt2 weight. w_b1 and w_b2 are the params of two linear layer
         Output: Tensor
     """
+    # 获取 k 的维度，直接读取张量最后一维的值
     d_k = k.shape[-1]
     # scaled dot-product attention: softmax(q k^T / sqrt(d_k) + mask) v
+    # 计算权重
+    # k.transpose(-2, -1) 直接执行转置运算
     scores = q @ k.transpose(-2, -1) / math.sqrt(d_k)
     scores = scores + mask
     weights = softmax(scores)
@@ -113,6 +129,14 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Task: Split the q,k,v matrix from the tensor x
         Notes: [n_seq, 3*n_embd] -> 3 * [n_seq, n_embd]
     """
+
+    # 从张量 x 中得到 qkv
+    """
+        chunk 函数调用：x.chunk(chunks, dim)
+            - chunks：期望返回的块数量（整数）。
+            - dim：沿哪个维度进行拆分，默认为 0。
+    """
+    # 按最后一个维度均匀拆分
     qkv = x.chunk(3, dim=-1)  # 3 * [n_seq, n_embd]
 
     # Split into heads
@@ -130,10 +154,15 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
+    # 获取张量第0维的大小
     n_seq = x.shape[0]
+    # 构建 mask 矩阵
     causal_mask = torch.triu(
-        torch.full((n_seq, n_seq), float('-inf'), dtype=x.dtype), diagonal=1
-    )  # upper triangle (future positions) = -inf, everything else = 0
+        # 创建一个全为 -inf 的矩阵
+        torch.full((n_seq, n_seq), float('-inf'), dtype=x.dtype), 
+        # 保留主对角线往上偏移 1 格的右上角范围内的元素，其余置零
+        diagonal=1
+    )
 
     # Perform attention over each head
     out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
@@ -143,6 +172,7 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Task: merge multi-heads results
         Notes: n_head * [n_seq, n_embd/n_head] --> [n_seq, n_embd]
     """
+    # 张量拼接
     x = torch.cat(out_heads, dim=-1)  # [n_seq, n_embd]
 
     # Out projection
