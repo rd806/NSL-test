@@ -15,7 +15,7 @@ def gelu(x):
         Input: Tensor
         Output: Tensor
     """
-    pass
+    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
 
 
 def softmax(x):
@@ -24,7 +24,10 @@ def softmax(x):
         Input: Tensor
         Output: Tensor
     """
-    pass
+    # subtract the max for numerical stability (does not change the result)
+    x = x - x.max(dim=-1, keepdim=True).values
+    e = torch.exp(x)
+    return e / e.sum(dim=-1, keepdim=True)
 
 
 def layer_norm(x, g_b, eps:float = 1e-5):
@@ -36,8 +39,12 @@ def layer_norm(x, g_b, eps:float = 1e-5):
         Output: Tensor
     """
     g, b = torch.Tensor(g_b['g']), torch.Tensor(g_b['b'])
-    
-    pass
+
+    # normalize over the last (embedding) dimension, then scale and shift
+    mean = x.mean(dim=-1, keepdim=True)
+    var = x.var(dim=-1, keepdim=True, unbiased=False)
+    x_hat = (x - mean) / torch.sqrt(var + eps)
+    return x_hat * g + b
 
 def linear(x, w_b):  # [m, in], [in, out], [out] -> [m, out]
     """
@@ -47,8 +54,11 @@ def linear(x, w_b):  # [m, in], [in, out], [out] -> [m, out]
             w_b: dictionary that load from gpt2 weight. w-weight and b-bias are the keys
         Output: Tensor
     """
-    w, b = w_b['w'], w_b['b']
-    pass
+    # keep everything as torch tensors so that downstream ops (e.g. `.chunk`) work
+    x = torch.as_tensor(x)
+    w = torch.as_tensor(w_b['w']).to(x.dtype)
+    b = torch.as_tensor(w_b['b']).to(x.dtype)
+    return x @ w + b
     
 
 def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -61,7 +71,7 @@ def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Output: Tensor
     """
     w_b1, w_b2 = mlp['c_fc'], mlp['c_proj']
-    pass
+    return linear(gelu(linear(x, w_b1)), w_b2)
 
 
 def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
@@ -77,7 +87,12 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
             mlp: dictionary that load from gpt2 weight. w_b1 and w_b2 are the params of two linear layer
         Output: Tensor
     """
-    pass
+    d_k = k.shape[-1]
+    # scaled dot-product attention: softmax(q k^T / sqrt(d_k) + mask) v
+    scores = q @ k.transpose(-2, -1) / math.sqrt(d_k)
+    scores = scores + mask
+    weights = softmax(scores)
+    return weights @ v
 
 def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
@@ -98,7 +113,7 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Task: Split the q,k,v matrix from the tensor x
         Notes: [n_seq, 3*n_embd] -> 3 * [n_seq, n_embd]
     """
-    qkv = None # need to modify
+    qkv = x.chunk(3, dim=-1)  # 3 * [n_seq, n_embd]
 
     # Split into heads
     qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
@@ -115,7 +130,10 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
-    causal_mask = None # need to modify
+    n_seq = x.shape[0]
+    causal_mask = torch.triu(
+        torch.full((n_seq, n_seq), float('-inf'), dtype=x.dtype), diagonal=1
+    )  # upper triangle (future positions) = -inf, everything else = 0
 
     # Perform attention over each head
     out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
@@ -125,8 +143,8 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Task: merge multi-heads results
         Notes: n_head * [n_seq, n_embd/n_head] --> [n_seq, n_embd]
     """
-    x = None # need to modify
-    
+    x = torch.cat(out_heads, dim=-1)  # [n_seq, n_embd]
+
     # Out projection
     x = linear(x, c_proj)  # [n_seq, n_embd] -> [n_seq, n_embd]
     
@@ -190,7 +208,36 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
     current_inputs = list(inputs)
 
     while len(generated_ids) < n_tokens_to_generate:
-        pass
+        # 1. the draft model greedily proposes K tokens, one autoregressive step each
+        draft_ids = []
+        for _ in range(K):
+            draft_logits = gpt2(current_inputs + draft_ids, draft_params, hparams_draft["n_head"])
+            draft_ids.append(int(np.argmax(draft_logits[-1])))
+
+        # 2. the target model scores the whole prompt + K drafted tokens in ONE forward pass
+        target_logits = gpt2(current_inputs + draft_ids, target_params, hparams_target["n_head"])
+        n = len(current_inputs)
+
+        # target_logits[n - 1 + i] is the target's greedy prediction for the token
+        # following position n - 1 + i, i.e. its choice for draft_ids[i].
+        # Accept the longest prefix on which draft and target agree.
+        accepted = []
+        for i in range(K):
+            target_id = int(np.argmax(target_logits[n - 1 + i]))
+            if target_id == draft_ids[i]:
+                accepted.append(draft_ids[i])
+            else:
+                # first mismatch: this token is corrected by the target, then we stop
+                accepted.append(target_id)
+                break
+        else:
+            # all K drafts were accepted -> the target's next token comes for free
+            accepted.append(int(np.argmax(target_logits[n - 1 + K])))
+
+        # 3. commit the accepted tokens, truncating any overshoot on the last round
+        accepted = accepted[: n_tokens_to_generate - len(generated_ids)]
+        generated_ids.extend(accepted)
+        current_inputs.extend(accepted)
 
     return generated_ids
 
