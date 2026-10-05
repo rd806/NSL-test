@@ -144,12 +144,12 @@ def mha(x, attn, n_head, kv_cache=None):  # [n_seq, n_embd] -> [n_seq, n_embd]
     # KV cache：把历史 token 的 k/v 拼到当前步前面
     # 这里缓存的是「未分头」的完整 n_embd，避免逐头记账
     q, k, v = qkv
-    if kv_cache is not None:
+    if kv_cache is not None:    # 读缓存
         if kv_cache['k'] is not None:
             k = torch.cat([kv_cache['k'], k], dim=0)  # [n_past, n_embd] + [n_q, n_embd] -> [n_k, n_embd]
             v = torch.cat([kv_cache['v'], v], dim=0)
-        # 写回缓存，供下一步（以及下一层）使用
-        kv_cache['k'], kv_cache['v'] = k, v
+        kv_cache['k'], kv_cache['v'] = k, v     # 写回缓存
+    # 返回拼接结果
     qkv = (q, k, v)
 
     # Split into heads
@@ -208,15 +208,13 @@ def transformer_block(x, block, n_head, kv_cache=None):  # [n_seq, n_embd] -> [n
 
 
 def new_kv_cache(params):
-    """
-        新建一个空的 KV cache：每层一个 {'k': None, 'v': None}
-    """
+    # 新建一个空的 KV cache：每层一个 {'k': None, 'v': None}
     return [{'k': None, 'v': None} for _ in params['blocks']]
 
 
 def gpt2(inputs, params, n_head, kv_cache=None):  # [n_seq] -> [n_seq, n_vocab]
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
-    # KV cache 里已有的历史长度（从缓存张量本身推导，回滚后也不会失步）
+    # KV cache 里已有的历史长度（从缓存张量本身推导）
     n_past = 0
     if kv_cache is not None and kv_cache[0]['k'] is not None:
         n_past = kv_cache[0]['k'].shape[0]
@@ -226,7 +224,8 @@ def gpt2(inputs, params, n_head, kv_cache=None):  # [n_seq] -> [n_seq, n_vocab]
     x = torch.Tensor(x)
     # forward pass through n_layer transformer blocks
     for i, block in enumerate(blocks):
-        layer_cache = None if kv_cache is None else kv_cache[i]  # 每层独立缓存
+        # 每层独立缓存
+        layer_cache = None if kv_cache is None else kv_cache[i]
         x = transformer_block(x, block, n_head=n_head, kv_cache=layer_cache)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
     # projection to vocab
@@ -246,7 +245,8 @@ def generate(inputs, params, n_head, n_tokens_to_generate, use_cache=True):
         logits = gpt2(step_inputs, params, n_head=n_head, kv_cache=kv_cache)  # model forward pass
         next_id = int(np.argmax(logits[-1]))  # greedy sampling
         inputs.append(next_id)  # append prediction to input
-        # 启用缓存时历史已进 KV cache，后续只需喂最新 token；否则仍要喂完整序列
+        # 启用缓存时历史已进 KV cache，后续只需喂最新 token；[next_id]
+        # 否则仍要喂完整序列 inputs
         step_inputs = [next_id] if kv_cache is not None else inputs
 
     return inputs[len(inputs) - n_tokens_to_generate :]  # only return generated ids
