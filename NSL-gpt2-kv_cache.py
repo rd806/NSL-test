@@ -4,6 +4,7 @@ import time
 import math
 torch.set_printoptions(8)
 
+# 包含 kv_cache 的版本
 def gelu(x):
     """
         Task: Use the torch API to implement the approximate calculation formula of the `GELU`
@@ -110,14 +111,15 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
     weights = softmax(scores)
     return weights @ v
 
-def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def mha(x, attn, n_head, kv_cache=None):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
         Task: Complete the code of the multi-head attention
-        
-        Input: 
+
+        Input:
             x: Tensor
             attn: dictionary that load from gpt2 weight. c_attn and c_proj are the params of two linear layer
             n_head: number of head
+            kv_cache: 本层的缓存字典 {'k': Tensor, 'v': Tensor}，None 表示不使用 KV cache
         Output: Tensorying multi-head attention and linear transformation, shape [n_seq, n_embd].
     """
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
@@ -139,6 +141,17 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     # 按最后一个维度均匀拆分
     qkv = x.chunk(3, dim=-1)  # 3 * [n_seq, n_embd]
 
+    # KV cache：把历史 token 的 k/v 拼到当前步前面
+    # 这里缓存的是「未分头」的完整 n_embd，避免逐头记账
+    q, k, v = qkv
+    if kv_cache is not None:
+        if kv_cache['k'] is not None:
+            k = torch.cat([kv_cache['k'], k], dim=0)  # [n_past, n_embd] + [n_q, n_embd] -> [n_k, n_embd]
+            v = torch.cat([kv_cache['v'], v], dim=0)
+        # 写回缓存，供下一步（以及下一层）使用
+        kv_cache['k'], kv_cache['v'] = k, v
+    qkv = (q, k, v)
+
     # Split into heads
     qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
     qkv_heads = list(zip(*qkv_heads))  # [3, n_head, n_seq, n_embd/n_head]
@@ -154,14 +167,15 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
-    # 获取张量第0维的大小
-    n_seq = x.shape[0]
+    # 获取 query/key 的序列长度（有 KV cache 时 k 比 q 长，不能再用 x.shape[0]）
+    n_q, n_k = q.shape[0], k.shape[0]
     # 构建 mask 矩阵
     causal_mask = torch.triu(
         # 创建一个全为 -inf 的矩阵
-        torch.full((n_seq, n_seq), float('-inf'), dtype=x.dtype), 
-        # 保留主对角线往上偏移 1 格的右上角范围内的元素，其余置零
-        diagonal=1
+        torch.full((n_q, n_k), float('-inf'), dtype=x.dtype), 
+        # 保留主对角线往上偏移 1 + n_past 格的右上角范围内的元素，其余置零
+        # n_past = n_k - n_q；无缓存时 n_past = 0，正好退化为原来的 diagonal=1
+        diagonal=1 + (n_k - n_q)
     )
 
     # Perform attention over each head
@@ -181,11 +195,11 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     return x
 
 
-def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def transformer_block(x, block, n_head, kv_cache=None):  # [n_seq, n_embd] -> [n_seq, n_embd]
     mlp, attn, ln_1, ln_2 = block['mlp'], block['attn'], block['ln_1'], block['ln_2']
-    
+
     # multi-head causal self attention
-    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head, kv_cache=kv_cache)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
     # position-wise feed forward network
     x = x + ffn(layer_norm(x, ln_2), mlp)  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -193,28 +207,47 @@ def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     return x
 
 
-def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
+def new_kv_cache(params):
+    """
+        新建一个空的 KV cache：每层一个 {'k': None, 'v': None}
+    """
+    return [{'k': None, 'v': None} for _ in params['blocks']]
+
+
+def gpt2(inputs, params, n_head, kv_cache=None):  # [n_seq] -> [n_seq, n_vocab]
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
-    # token + positional embeddings
-    x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
-    
+    # KV cache 里已有的历史长度（从缓存张量本身推导，回滚后也不会失步）
+    n_past = 0
+    if kv_cache is not None and kv_cache[0]['k'] is not None:
+        n_past = kv_cache[0]['k'].shape[0]
+    # token + positional embeddings（位置要接在历史之后，不能每次都从 0 开始）
+    x = wte[inputs] + wpe[range(n_past, n_past + len(inputs))]  # [n_seq] -> [n_seq, n_embd]
+
     x = torch.Tensor(x)
     # forward pass through n_layer transformer blocks
-    for block in blocks:
-        x = transformer_block(x, block, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    for i, block in enumerate(blocks):
+        layer_cache = None if kv_cache is None else kv_cache[i]  # 每层独立缓存
+        x = transformer_block(x, block, n_head=n_head, kv_cache=layer_cache)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
     # projection to vocab
     x = layer_norm(x, ln_f)  # [n_seq, n_embd] -> [n_seq, n_embd]
     return x @ wte.T  # [n_seq, n_embd] -> [n_seq, n_vocab]
 
 
-def generate(inputs, params, n_head, n_tokens_to_generate):
+def generate(inputs, params, n_head, n_tokens_to_generate, use_cache=True):
     from tqdm import tqdm
 
+    # 生成 kv_cache
+    kv_cache = new_kv_cache(params) if use_cache else None
+    # 第一步喂完整 prompt（prefill），之后只喂新生成的 1 个 token
+    step_inputs = inputs  
+
     for _ in tqdm(range(n_tokens_to_generate), "generating"):  # auto-regressive decode loop
-        logits = gpt2(inputs, params, n_head=n_head)  # model forward pass
-        next_id = np.argmax(logits[-1])  # greedy sampling
-        inputs.append(int(next_id))  # append prediction to input
+        logits = gpt2(step_inputs, params, n_head=n_head, kv_cache=kv_cache)  # model forward pass
+        next_id = int(np.argmax(logits[-1]))  # greedy sampling
+        inputs.append(next_id)  # append prediction to input
+        # 启用缓存时历史已进 KV cache，后续只需喂最新 token；否则仍要喂完整序列
+        step_inputs = [next_id] if kv_cache is not None else inputs
 
     return inputs[len(inputs) - n_tokens_to_generate :]  # only return generated ids
 

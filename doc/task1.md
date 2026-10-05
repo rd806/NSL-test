@@ -37,8 +37,6 @@ $$\frac{1}{2} x\left[1+\tanh \left(\sqrt{\frac{2}{\pi}}\left(x+0.044715 x^{3}\ri
 其中的双曲余弦使用 `torch.tanh` 方法。
 
 > 三次方运算使用 `x**3`， 它一般情况下比 `torch.pow(x, 3)` 更快。
->
-> 实测 `torch.pow(x, 3)` 用时 5.11s，`x**3` 用时 5.29s。
 
 ### softmax
 
